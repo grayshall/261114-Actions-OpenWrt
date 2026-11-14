@@ -9,7 +9,7 @@
  # docker rmi `docker images -q`
 #
 
-name: Build my-r2s-OpenWrt
+name: Build my-x86-64 OpenWrt
 
 on:
   repository_dispatch:
