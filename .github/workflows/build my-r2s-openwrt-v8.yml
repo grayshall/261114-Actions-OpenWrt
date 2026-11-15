@@ -34,7 +34,7 @@
 #  diy-part2.sh、SSH 步、各项上传开关。
 #
 
-name: Build my-r2s-OpenWrt
+name: Build r2s-OpenWrt-v8
 
 on:
   repository_dispatch:
