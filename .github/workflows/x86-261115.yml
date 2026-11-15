@@ -46,7 +46,7 @@
 #  ROOTFS 分区大小覆盖 (在 diy-part2.sh 里把 .config 的 960 改成 1008)。
 #
 
-name: Build my-x86-OpenWrt-0422
+name: Build my-x86-OpenWrt-new
 
 on:
   repository_dispatch:
