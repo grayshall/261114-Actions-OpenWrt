@@ -1,0 +1,337 @@
+#
+# Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
+#
+# This is free software, licensed under the MIT License.
+# See /LICENSE for more information.
+#
+# https://github.com/P3TERX/Actions-OpenWrt
+# Description: Build OpenWrt using GitHub Actions
+#
+# 修订说明 (2026-11-14 第二版, 依据 logs_118063857847 完整日志 + 本次截图):
+#  [致命错误] 截图里的 exit code 2 不是磁盘/警告导致的, 真正链条在日志里:
+#    第1次并行编译死在 tools/elfutils (重试后通过, 属并行偶发);
+#    第2/3次都死在 package/libs/gettext-full [host]:
+#    gettext-0.22.5 的 autogen 调用主机 gnulib-tool.py 时, 其自带的旧补丁
+#    gnulib-local/lib/exitfail.h.diff 已对不上 LEDE master 现在的新版 gnulib,
+#    "1 out of 1 hunk FAILED ... didn't apply cleanly" 后直接 Stop。
+#    这是 LEDE master 源码内部的版本错位 (你的 .config 写内核 6.12,
+#    master 实际已在编 6.18, 同属这种漂移), 不是你的配置写错。
+#    gnulib 官方邮件列表对同一报错的结论是: 删掉那个 .diff 文件即可通过。
+#    本文件在 Download 后、Compile 前新增了定点修复步执行这件事 (见下)。
+#  [警告1] tool-cache 弃用: free-disk-space 固定 @v2, 改名 preinstalled-runtimes。
+#  [警告2] apt-get remove azure-cli... 那条是 free-disk-space 内部的容错警告,
+#    它自己会 Proceeding 继续, 不影响构建, 无法也不必在 yml 里消除。
+#  其它优化:
+#  1. 删掉 apt full-upgrade (白耗约 4 分钟且引入不可控变化); 补 LEDE 官方
+#     依赖清单里有而原文件漏掉的 xz-utils; systemctl/timedatectl 加 || true。
+#  2. 步骤顺序改为 Checkout -> 释放磁盘 -> 初始化, 避免先装依赖又被清盘步删掉。
+#  3. 编译从三段重试 (失败时白烧约 100 分钟) 改为两段: 并行编一次, 失败才
+#     单线程 V=s 编一次, 且全程 tee 到 build.log; 失败时自动上传 build.log
+#     和 openwrt/logs 做产物, 下次不用再下载整包日志找错。
+#  4. Organize/Upload firmware 加编译成功门槛: 上次编译失败后它照样跑,
+#     还上传了一个空的 OpenWrt_firmware 产物, 容易误判成成功。
+#  5. ::set-output 已被 GitHub 停用, cowtransfer/WeTransfer/Release 三步
+#     全部改成 $GITHUB_OUTPUT (这三步目前被开关关闭, 属潜伏雷, 一并拆掉)。
+#  6. action-gh-release v1 -> v2; 两个清理步换新版并加 continue-on-error,
+#     清理失败不再把成功的构建标红。
+#  7. 去掉 watch(star 触发) —— 别人点个星就触发一次几小时的构建;
+#     ssh 输入改 required: false; 加 concurrency 自动取消同仓库的旧运行;
+#     顶层声明 permissions, 保证发 Release/删记录不被默认权限收紧卡住。
+#  8. 新增 REPO_COMMIT 锁版开关 (默认空 = 跟 master 最新)。若上游再次漂移
+#     把构建弄坏, 把它填成一个能编过的 lede commit 哈希即可锁死版本回滚,
+#     不用再改其它任何地方。
+#  保留不动: 仓库名/工作流名、LEDE 地址、CONFIG_FILE=260505-x86.config.txt、
+#  d3.sh 的用法 (本仓库里它就是 feeds.conf.default 的内容, 是"移动"不是
+#  "执行", 上一版把它当脚本跑是错的, 本版已纠正)、diy-part2.sh、SSH 步、
+#  ROOTFS 分区大小覆盖 (在 diy-part2.sh 里把 .config 的 960 改成 1008)。
+#
+
+name: Build my-x86-OpenWrt-0422
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH connection to Actions'
+        required: false
+        default: 'false'
+#  schedule:
+#    - cron: 0 8 * * 5
+
+# 同一仓库只保留最新一次构建, 旧的自动取消, 省时间省额度
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  REPO_URL: https://github.com/coolsnowwolf/lede
+  REPO_BRANCH: master
+  # 锁版开关: 留空 = 用 master 最新; 填 lede 的 commit 哈希 = 锁死该版本
+  REPO_COMMIT: ''
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: 260505-x86.config.txt
+  DIY_P1_SH: d3.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_COWTRANSFER: false
+  UPLOAD_WETRANSFER: false
+  UPLOAD_RELEASE: false
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+
+    - name: 释放磁盘空间
+      uses: jlumbroso/free-disk-space@v2
+      with:
+        # v2 起 tool-cache 改名为 preinstalled-runtimes (旧名 v3.0.0 后失效)
+        preinstalled-runtimes: true
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        # v2 起 swap-storage 默认改成 false, 显式写回 true 保持原释放力度
+        swap-storage: true
+
+    - name: Initialization Environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo -E rm -rf /usr/share/dotnet /etc/mysql /etc/php /etc/apt/sources.list.d /usr/local/lib/android
+        sudo -E apt-mark hold grub-efi-amd64-signed
+        sudo -E apt-get update
+        sudo -E apt-get -y purge azure-cli* docker* ghc* zulu* llvm* firefox google* dotnet* powershell* openjdk* mysql* php* mongodb* snap*
+        sudo -E apt-get -y install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk gcc-multilib g++-multilib gettext genisoimage git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool llvm lrzsz msmtp ninja-build p7zip p7zip-full patch pkgconf python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd xz-utils zlib1g-dev
+        sudo -E systemctl daemon-reload || true
+        sudo -E apt-get -y autoremove --purge || true
+        sudo -E apt-get clean
+        sudo -E timedatectl set-timezone "Asia/Shanghai" || true
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        if [ -n "$REPO_COMMIT" ]; then
+          cd openwrt && git checkout $REPO_COMMIT && cd ..
+        fi
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    - name: Load custom feeds
+      run: |
+        # 本仓库的 d3.sh 内容就是 feeds.conf.default 本身, 直接移动, 不要执行
+        [ -e $DIY_P1_SH ] && mv $DIY_P1_SH openwrt/feeds.conf.default
+
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Load custom configuration
+      run: |
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x $DIY_P2_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: SSH connection to Actions
+      uses: P3TERX/ssh2actions@v1.0.0
+      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
+      env:
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+    - name: Cache dl downloads
+      # 缓存 dl 源码包目录: 每次从零下载要拉几个 GB (内核/gcc/golang/samba 等),
+      # 慢的时候能拖 1 小时。缓存后配置不变就直接复用, Download 只剩校验。
+      # key 绑 .config 和 feeds 清单: 改了配置或源就自动换新缓存, 不会用错包。
+      # 注意 GitHub 缓存上限 10 GB/仓库, dl 约 3-5 GB, 放得下; 首次运行仍需
+      # 完整下载一次来存缓存, 从第二次开始才变快。
+      uses: actions/cache@v5
+      with:
+        path: openwrt/dl
+        key: dl-${{ runner.os }}-${{ hashFiles('openwrt/.config', 'openwrt/feeds.conf.default') }}
+        restore-keys: |
+          dl-${{ runner.os }}-
+
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        make defconfig
+        # 下载策略 (经 2026-11-14 两次实跑修正):
+        # 不能再用 20 分钟短超时硬杀 —— gcc/内核这类大包在慢线路上一次
+        # 就要下很久, 杀掉后下次还得从零重下 (下载器不支持断点续传),
+        # 三次 20 分钟反而全耗在重复下大包上。
+        # 改法: 第一次给足 90 分钟完整跑; 若中途因个别源报错退出,
+        # 再增量补跑一次 (已下好的包会自动跳过)。
+        timeout 5400 make download -j8 || make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Fix gettext-full gnulib exitfail patch
+      # 定点修复本次致命错误: gettext-0.22.5 自带的 gnulib-local/lib/exitfail.h.diff
+      # 已对不上 LEDE master 的新版 gnulib, gnulib-tool.py 打不上就直接 Stop。
+      # 做法: 解开 dl 里的 gettext 源码包, 删掉这一个过期的 .diff, 再按原格式
+      # 打回去 (删它后 exitfail.h 用 gnulib 当前版本, gnulib 官方已验证可过)。
+      # 全程留备份并校验, 找不到文件就跳过, 绝不让修复步本身把构建弄坏。
+      run: |
+        cd openwrt
+        GT=$(ls dl/gettext-*.tar.xz 2>/dev/null | head -n 1)
+        if [ -z "$GT" ]; then
+          echo "未找到 dl/gettext-*.tar.xz, 跳过本修复"
+          exit 0
+        fi
+        echo "处理源码包: $GT"
+        cp "$GT" /tmp/gettext-backup.tar.xz
+        rm -rf /tmp/gettext-fix && mkdir -p /tmp/gettext-fix
+        tar -xJf "$GT" -C /tmp/gettext-fix
+        echo "删除前命中的过期 diff:"
+        find /tmp/gettext-fix -path "*gnulib-local*" -name "exitfail.h.diff" -print
+        find /tmp/gettext-fix -path "*gnulib-local*" -name "exitfail.h.diff" -delete
+        TOPDIR=$(ls /tmp/gettext-fix | head -n 1)
+        tar -cJf "$GT" -C /tmp/gettext-fix "$TOPDIR"
+        if tar -tJf "$GT" > /dev/null 2>&1; then
+          echo "重打包完成并校验通过: $GT"
+        else
+          echo "重打包校验失败, 已恢复原包"
+          cp /tmp/gettext-backup.tar.xz "$GT"
+        fi
+        rm -rf /tmp/gettext-fix /tmp/gettext-backup.tar.xz
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        set -o pipefail
+        make -j$(nproc) 2>&1 | tee build.log || make -j1 V=s 2>&1 | tee -a build.log
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: Upload build log on failure
+      uses: actions/upload-artifact@v7
+      if: failure() && steps.compile.conclusion == 'failure'
+      with:
+        name: OpenWrt_build_log${{ env.FILE_DATE }}
+        path: |
+          openwrt/build.log
+          openwrt/logs
+        if-no-files-found: ignore
+        retention-days: 7
+
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Upload bin directory
+      uses: actions/upload-artifact@v7
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      with:
+        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
+        compression-level: 0
+        retention-days: 7
+
+    - name: Organize files
+      id: organize
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        # 给固件文件名前加编译日期前缀, 如 20261114-openwrt-x86-64-...img.gz
+        # 用前缀不用后缀: 不破坏 .img.gz 这类双扩展名, 文件夹里还能按日期排序
+        BUILD_DATE=$(date +"%Y%m%d")
+        for f in *; do
+          [ "$f" = "sha256sums" ] && continue
+          [ -f "$f" ] && mv "$f" "${BUILD_DATE}-${f}"
+        done
+        # 改名后必须重算 sha256sums, 否则校验文件里的文件名对不上
+        rm -f sha256sums
+        sha256sum * > sha256sums
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@v7
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+        compression-level: 0
+        retention-days: 7
+
+    - name: Upload firmware to cowtransfer
+      id: cowtransfer
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_COWTRANSFER == 'true' && !cancelled()
+      run: |
+        # 注意: git.io 已停服, 这一步现已不可用; 保持关闭, 不要打开 UPLOAD_COWTRANSFER
+        curl -fsSL git.io/file-transfer | sh
+        ./transfer cow --block 2621440 -s -p 64 --no-progress ${FIRMWARE} 2>&1 | tee cowtransfer.log
+        echo "::warning file=cowtransfer.com::$(cat cowtransfer.log | grep https)"
+        echo "url=$(cat cowtransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to WeTransfer
+      id: wetransfer
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_WETRANSFER == 'true' && !cancelled()
+      run: |
+        # 注意: git.io 已停服, 这一步现已不可用; 保持关闭, 不要打开 UPLOAD_WETRANSFER
+        curl -fsSL git.io/file-transfer | sh
+        ./transfer wet -s -p 16 --no-progress ${FIRMWARE} 2>&1 | tee wetransfer.log
+        echo "::warning file=wetransfer.com::$(cat wetransfer.log | grep https)"
+        echo "url=$(cat wetransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
+
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        touch release.txt
+        [ $UPLOAD_COWTRANSFER = true ] && echo "🔗 [Cowtransfer](${{ steps.cowtransfer.outputs.url }})" >> release.txt
+        [ $UPLOAD_WETRANSFER = true ] && echo "🔗 [WeTransfer](${{ steps.wetransfer.outputs.url }})" >> release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@v2
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: ${{ env.FIRMWARE }}/*
+
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@v2
+      continue-on-error: true
+      with:
+        retain_days: 1
+        keep_minimum_runs: 3
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@v0.1.0
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      continue-on-error: true
+      with:
+        keep_latest: 3
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
