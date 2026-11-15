@@ -163,7 +163,7 @@ jobs:
       # key 绑 .config 和 feeds 清单: 改了配置或源就自动换新缓存, 不会用错包。
       # 注意 GitHub 缓存上限 10 GB/仓库, dl 约 3-5 GB, 放得下; 首次运行仍需
       # 完整下载一次来存缓存, 从第二次开始才变快。
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: openwrt/dl
         key: dl-${{ runner.os }}-${{ hashFiles('openwrt/.config', 'openwrt/feeds.conf.default') }}
