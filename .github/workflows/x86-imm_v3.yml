@@ -43,7 +43,7 @@
 #  纯头文件), small 源的 DEPENDS 没跟上。补丁只删这条过期依赖声明;
 #  trojan-plus 本体已编译成功, 二进制并不链接这个库。
 
-name: Build my-x86-OpenWrt-0422-imm
+name: Build my-x86-OpenWrt-v3_imm
 
 on:
   repository_dispatch:
