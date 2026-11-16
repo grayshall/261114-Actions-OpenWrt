@@ -26,7 +26,7 @@
 #  跑完请核对关键包 (如 luci-app-ssr-plus, 来自 small 源) 是否还在。
 #
 
-name: Build my-x86-OpenWrt-0422-imm
+name: Build x86-OpenWrt-imm
 
 on:
   repository_dispatch:
