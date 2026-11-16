@@ -36,7 +36,7 @@
 #  imm v1 已验证: gettext-full 0.24.2 主机编译顺利过关 (334 秒),
 #  lede 时代的 gnulib 补丁连环 Stop 在 ImmortalWrt 上确认不存在。
 
-name: Build my-x86-OpenWrt-0422-imm
+name: Build x86-OpenWrt-v1-imm
 
 on:
   repository_dispatch:
