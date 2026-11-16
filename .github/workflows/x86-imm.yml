@@ -1,0 +1,277 @@
+#
+# Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
+#
+# This is free software, licensed under the MIT License.
+# See /LICENSE for more information.
+#
+# https://github.com/P3TERX/Actions-OpenWrt
+# Description: Build OpenWrt using GitHub Actions
+#
+# ImmortalWrt 版说明 (2026-11-15, 路线 C 一步到位):
+#  本文件由 lede 版改造而来, 与 lede 版的区别只有四处:
+#  1. 源码换成 ImmortalWrt (REPO_URL=immortalwrt/immortalwrt, master)。
+#     原因: lede 的 gettext-full 还停在 0.22.5 (2023), 却配了 2026-07 的
+#     gnulib 快照, 其 gnulib-local 补丁连环打不上 (exitfail.h / hash.c
+#     先后 Stop); ImmortalWrt 的 gettext 是 0.24.2, 与其 gnulib 同步,
+#     没有这个问题。lede 版那套源码包重打包 + 同步 PKG_HASH 的修复步
+#     因此整体删除, 不再需要。
+#  2. feeds 改用 d3-imm.sh: 基础源换 ImmortalWrt/OpenWrt 官方,
+#     kenzo/small 与原 d3.sh 一致; darkmatter 两行都已注释掉
+#     (高版本 Linux 下容易出错, 不再启用该主题源)。
+#  3. 工作流名加 -imm 后缀、产物名加 _imm, 与 lede 版区分。
+#  4. 其余优化沿用 lede 版: 下载 90+60 分钟两遍、编译两段式 + build.log
+#     产物、固件文件名日期前缀、REPO_COMMIT 锁版开关 (默认空)。
+#  注意: CONFIG_FILE 仍用原来的 lede 配置, 首次构建时 defconfig 会按
+#  ImmortalWrt 的包集重新对齐, 个别包名/依赖不同可能被悄悄丢弃; 首次
+#  跑完请核对关键包 (如 luci-app-ssr-plus, 来自 small 源) 是否还在。
+#
+
+name: Build my-x86-OpenWrt-0422-imm
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH connection to Actions'
+        required: false
+        default: 'false'
+#  schedule:
+#    - cron: 0 8 * * 5
+
+# 同一仓库只保留最新一次构建, 旧的自动取消, 省时间省额度
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: master
+  # 锁版开关: 留空 = 用 master 最新; 填 immortalwrt 的 commit 哈希 = 锁死该版本
+  REPO_COMMIT: ''
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: 260505-x86.config.txt
+  DIY_P1_SH: d3-imm.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_COWTRANSFER: false
+  UPLOAD_WETRANSFER: false
+  UPLOAD_RELEASE: false
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+
+    - name: 释放磁盘空间
+      uses: jlumbroso/free-disk-space@v2
+      with:
+        # v2 起 tool-cache 改名为 preinstalled-runtimes (旧名 v3.0.0 后失效)
+        preinstalled-runtimes: true
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        # v2 起 swap-storage 默认改成 false, 显式写回 true 保持原释放力度
+        swap-storage: true
+
+    - name: Initialization Environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo -E rm -rf /usr/share/dotnet /etc/mysql /etc/php /etc/apt/sources.list.d /usr/local/lib/android
+        sudo -E apt-mark hold grub-efi-amd64-signed
+        sudo -E apt-get update
+        sudo -E apt-get -y purge azure-cli* docker* ghc* zulu* llvm* firefox google* dotnet* powershell* openjdk* mysql* php* mongodb* snap*
+        sudo -E apt-get -y install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk gcc-multilib g++-multilib gettext genisoimage git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool llvm lrzsz msmtp ninja-build p7zip p7zip-full patch pkgconf python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd xz-utils zlib1g-dev
+        sudo -E systemctl daemon-reload || true
+        sudo -E apt-get -y autoremove --purge || true
+        sudo -E apt-get clean
+        sudo -E timedatectl set-timezone "Asia/Shanghai" || true
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        if [ -n "$REPO_COMMIT" ]; then
+          cd openwrt && git checkout $REPO_COMMIT && cd ..
+        fi
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    - name: Load custom feeds
+      run: |
+        # 本仓库的 d3.sh 内容就是 feeds.conf.default 本身, 直接移动, 不要执行
+        [ -e $DIY_P1_SH ] && mv $DIY_P1_SH openwrt/feeds.conf.default
+
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Load custom configuration
+      run: |
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x $DIY_P2_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: SSH connection to Actions
+      uses: P3TERX/ssh2actions@v1.0.0
+      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
+      env:
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        make defconfig
+        # 下载策略 (经 2026-11-14 两次实跑修正):
+        # 不能再用 20 分钟短超时硬杀 —— gcc/内核这类大包在慢线路上一次
+        # 就要下很久, 杀掉后下次还得从零重下 (下载器不支持断点续传),
+        # 三次 20 分钟反而全耗在重复下大包上。
+        # 改法: 第一次给足 90 分钟完整跑; 若中途因个别源报错退出,
+        # 再增量补跑一次 (已下好的包会自动跳过)。补跑也设 60 分钟上限:
+        # 2026-11-15 r2s 实跑中补跑无上限, 下载一步拖满 3 小时, 就算下完
+        # 也会撞上 job 的 6 小时总上限、编译被腰斩。两遍合计 2.5 小时还
+        # 下不完, 这次运行本就无望, 早停早重跑。
+        timeout 5400 make download -j8 || timeout 3600 make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        set -o pipefail
+        make -j$(nproc) 2>&1 | tee build.log || make -j1 V=s 2>&1 | tee -a build.log
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: Upload build log on failure
+      uses: actions/upload-artifact@v7
+      if: failure() && steps.compile.conclusion == 'failure'
+      with:
+        name: OpenWrt_build_log_imm${{ env.FILE_DATE }}
+        path: |
+          openwrt/build.log
+          openwrt/logs
+        if-no-files-found: ignore
+        retention-days: 7
+
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Upload bin directory
+      uses: actions/upload-artifact@v7
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      with:
+        name: OpenWrt_bin_imm${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
+        compression-level: 0
+        retention-days: 7
+
+    - name: Organize files
+      id: organize
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        # 给固件文件名前加编译日期前缀, 如 20261114-openwrt-x86-64-...img.gz
+        # 用前缀不用后缀: 不破坏 .img.gz 这类双扩展名, 文件夹里还能按日期排序
+        BUILD_DATE=$(date +"%Y%m%d")
+        for f in *; do
+          [ "$f" = "sha256sums" ] && continue
+          [ -f "$f" ] && mv "$f" "${BUILD_DATE}-${f}"
+        done
+        # 改名后必须重算 sha256sums, 否则校验文件里的文件名对不上
+        rm -f sha256sums
+        sha256sum * > sha256sums
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@v7
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware_imm${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+        compression-level: 0
+        retention-days: 7
+
+    - name: Upload firmware to cowtransfer
+      id: cowtransfer
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_COWTRANSFER == 'true' && !cancelled()
+      run: |
+        # 注意: git.io 已停服, 这一步现已不可用; 保持关闭, 不要打开 UPLOAD_COWTRANSFER
+        curl -fsSL git.io/file-transfer | sh
+        ./transfer cow --block 2621440 -s -p 64 --no-progress ${FIRMWARE} 2>&1 | tee cowtransfer.log
+        echo "::warning file=cowtransfer.com::$(cat cowtransfer.log | grep https)"
+        echo "url=$(cat cowtransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to WeTransfer
+      id: wetransfer
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_WETRANSFER == 'true' && !cancelled()
+      run: |
+        # 注意: git.io 已停服, 这一步现已不可用; 保持关闭, 不要打开 UPLOAD_WETRANSFER
+        curl -fsSL git.io/file-transfer | sh
+        ./transfer wet -s -p 16 --no-progress ${FIRMWARE} 2>&1 | tee wetransfer.log
+        echo "::warning file=wetransfer.com::$(cat wetransfer.log | grep https)"
+        echo "url=$(cat wetransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
+
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        touch release.txt
+        [ $UPLOAD_COWTRANSFER = true ] && echo "🔗 [Cowtransfer](${{ steps.cowtransfer.outputs.url }})" >> release.txt
+        [ $UPLOAD_WETRANSFER = true ] && echo "🔗 [WeTransfer](${{ steps.wetransfer.outputs.url }})" >> release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@v2
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: ${{ env.FIRMWARE }}/*
+
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@v2
+      continue-on-error: true
+      with:
+        retain_days: 1
+        keep_minimum_runs: 3
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@v0.1.0
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      continue-on-error: true
+      with:
+        keep_latest: 3
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
