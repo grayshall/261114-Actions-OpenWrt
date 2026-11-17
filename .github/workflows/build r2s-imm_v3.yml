@@ -43,7 +43,7 @@
 #  trojan-plus 的 DEPENDS 还写着 +boost-system, 不删会在最后
 #  package/install 时让 opkg 装配失败 (x86 的 imm v2 就死在这里)。
 
-name: Build my-r2s-OpenWrt-imm
+name: Build r2s-imm_v3
 
 on:
   repository_dispatch:
