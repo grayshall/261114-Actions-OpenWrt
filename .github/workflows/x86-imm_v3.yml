@@ -72,7 +72,7 @@ env:
   # 锁版开关: 留空 = 用 master 最新; 填 immortalwrt 的 commit 哈希 = 锁死该版本
   REPO_COMMIT: ''
   FEEDS_CONF: feeds.conf.default
-  CONFIG_FILE: 261117-x86.config.txt
+  CONFIG_FILE: 261118-x86.config.txt
   DIY_P1_SH: d3-imm.sh
   DIY_P2_SH: diy-part2.sh
   UPLOAD_BIN_DIR: false
