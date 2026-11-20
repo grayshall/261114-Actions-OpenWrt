@@ -131,6 +131,33 @@ jobs:
         fi
         ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
+    - name: Fetch prebuilt LLVM-BPF toolchain
+      run: |
+        cd openwrt
+        ver=$(sed -nE 's/^PKG_VERSION:=[[:space:]]*(.+)$/\1/p' tools/llvm-bpf/Makefile | head -n1)
+        [ -n "$ver" ] || { echo "::error::cannot read PKG_VERSION from tools/llvm-bpf"; exit 1; }
+        name="llvm-bpf-${ver}.$(uname -s)-$(uname -m).tar.zst"
+        for base in https://downloads.immortalwrt.org https://downloads.openwrt.org; do
+          dir="$base/snapshots/targets/x86/64"
+          rm -rf "/tmp/$name" /tmp/llvm-sums /tmp/llvm-sum llvm-bpf "llvm-bpf-${ver}."*
+          curl -fsSL --connect-timeout 15 -m 900 -o "/tmp/$name" "$dir/$name" || continue
+          curl -fsSL --connect-timeout 15 -m 120 -o /tmp/llvm-sums "$dir/sha256sums" || continue
+          grep -F -- " *$name" /tmp/llvm-sums > /tmp/llvm-sum || continue
+          (cd /tmp && sha256sum -c llvm-sum) || { echo "::warning::checksum mismatch for $name from $base"; continue; }
+          tar --zstd -xf "/tmp/$name" -C . || continue
+          if [ -f llvm-bpf/.llvm-version ]; then
+            if ! llvm-bpf/bin/clang --version || ! printf 'int x;\n' | llvm-bpf/bin/clang -target bpf -x c -c - -o /tmp/llvm-bpf-probe.o; then
+              echo "::error::prebuilt LLVM-BPF $ver cannot compile BPF on this build host"
+              exit 1
+            fi
+            rm -f /tmp/llvm-bpf-probe.o "/tmp/$name"
+            echo "::notice::prebuilt LLVM-BPF $ver from $base"
+            exit 0
+          fi
+        done
+        echo "::error::$name is unavailable from both mirrors; wait for the buildbot publish or switch the config back to CONFIG_BPF_TOOLCHAIN_BUILD_LLVM"
+        exit 1
+
     - name: Load custom feeds
       run: |
         # 本仓库的 d3.sh 内容就是 feeds.conf.default 本身, 直接移动, 不要执行
